@@ -92,11 +92,16 @@ from nebula3_vlmtokens_expert.vlmtokens.data.vg_dataset import visual_genome_dat
 from torchvision import transforms
 
 class VisualGenomedatasetRoiLoader(visual_genome_dataset):
-    def __init__(self, max_words, indirect_indexing_dictionary=None, indeirect_json_file_path=None, no_roi_extraction = False):
+    def __init__(self, max_words, indirect_indexing_dictionary=None, 
+                indeirect_json_file_path=None, no_roi_extraction = False,
+                min_h=0, min_w=0):
+
         super(VisualGenomedatasetRoiLoader, self).__init__(max_words=max_words)
-        self.transform_ = transforms.Compose([transforms.ToTensor()])
+        self.transform_ = transforms.Compose([transforms.ToTensor()]) # HK the whole point is just no transform i.e convert to Tensor only
         self.no_roi_extraction = no_roi_extraction
-        if indirect_indexing_dictionary is not None and indeirect_json_file is None:
+        self.min_w = min_w
+        self.min_h = min_h
+        if indirect_indexing_dictionary is not None and indeirect_json_file_path is None:
             self.indirect_indexing_dictionary = indirect_indexing_dictionary
             annotation = {}
             skipped_count = 0
@@ -121,21 +126,21 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
 # Overrun with the new one
             self.annotation = annotation
             if indeirect_json_file_path is not None:
-                print("New image annotation file will be saved to ", indeirect_json_file_path)
+                print("New indirect image annotation file will be saved to ", indeirect_json_file_path)
                 with open(indeirect_json_file_path, "w") as f:
                     json.dump(annotation, f)
         elif indeirect_json_file_path is not None:
-            print("New image annotation file will be loaded to ", indeirect_json_file_path)
+            print("New indirect image annotation file will be loaded to ", indeirect_json_file_path)
             with open(indeirect_json_file_path, "r") as f:
                 self.annotation =json.load(f)
-            
-                
-
 
         return
 
     def __len__(self):
         return len(self.annotation)
+
+    def collate_fn(self, batch):
+        return batch[0]
 
     def __getitem__(self, index):    
             
@@ -146,8 +151,9 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
         image_id = os.path.basename(ann['image'])
         image = Image.open(image_path).convert('RGB')   
         #image = self.transform(image)
-        label = []
-        croped_images = []
+        label = list()
+        croped_images = list()
+        roi_coord = list()
         if self.no_roi_extraction == False:
             #print("OBJECTS ", len(ann['objects']))
             for i, visual_objects in enumerate(ann['objects']):
@@ -159,18 +165,23 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
                 
                 crop_image = image.crop((x,y,w,h))
                 width, height = crop_image.size
-                if width > 30 and height > 30:
+                if width > self.min_w and height > self.min_h:
                     #print(width, height)
                     croped_images.append(crop_image)
                     label.append(visual_objects['names'])
+                    roi_coord.append([x,y,w,h])
         else:
             croped_images.append(image)
             label.append(["full image"])
 
+        if len(croped_images ) == 0:
+            print('Warning No ROI was extracted !!!')
+            return [], ['None'], ['None'], image_id
+
         processed_frms = [self.transform(frm) for frm in croped_images]
         if not isinstance(processed_frms[0],Image.Image):
             processed_frms = torch.stack(processed_frms)
-        return processed_frms, label, image_id
+        return processed_frms, label, roi_coord, image_id
 
 # from torchvision import transforms
 # import ruamel.yaml as yaml
@@ -196,44 +207,77 @@ with open(os.path.join(vgenome_metadata, "paragraphs_v1.json"), "r") as f:
 sample_ids = np.loadtxt(os.path.join(vgenome_metadata, "sample_ids_ipc_vgenome_ids.txt"))
 image_ids_related_to_ipc = [images_data[int(ix)]['image_id'] for ix in sample_ids]
 
-video_dataset = VisualGenomedatasetRoiLoader(max_words=64, indirect_indexing_dictionary=image_ids_related_to_ipc,
+video_dataset = VisualGenomedatasetRoiLoader(max_words=-1, indirect_indexing_dictionary=image_ids_related_to_ipc,
                                                 indeirect_json_file_path=os.path.join(vgenome_metadata , "vgenome_image_data_related_to_1000_ipc_experiemnt.json"))
+train_loader = torch.utils.data.DataLoader(dataset=video_dataset, batch_size=1, shuffle=False,
+                                                    pin_memory=True, num_workers=0, collate_fn=video_dataset.collate_fn)
 # for vg_ob in tqdm.tqdm(sample_ids):
 #     cur_image_data = images_data[sample_ids[idx]]
 #     print("Object id", cur_image_data['image_id'])
 
 # ontology_imp = SingleOntologyImplementation('vg_objects', 'clip')
-if 1: # stats of objects 
+if 0: # stats of objects 
     label_stat = list()
-    for batch in video_dataset:
+    for batch in tqdm.tqdm(video_dataset):
         images_batch, label, image_id = batch
         label_stat.append(label)
+    label_stat = np.concatenate(label_stat)
     label_stat = sorted(label_stat)
     lbl_unique ,count = np.unique(label_stat, return_counts=True)
     ord_idx = np.argsort(count)[::-1]
-
-
-for batch in video_dataset:
-    images_batch, label, image_id = batch
-    # print(images_batch)
+    import matplotlib.pyplot as plt
+    
+    len = 40
+    height = count[ord_idx[:len]]
+    bars = lbl_unique[ord_idx[:len]]
+    x_pos = np.arange(bars.shape[0])
+    
+    # Create bars and choose color
+    plt.bar(x_pos, height, color = (0.5,0.1,0.5,0.6))
+    
+    # Add title and axis names
+    plt.title('Objects histogram')
+    plt.xlabel('Object')
+    plt.ylabel('Occurrences')
+    
+    # Create names on the x axis
+    plt.xticks(x_pos, bars, rotation='vertical')
+    plt.savefig(os.path.join(result_path, 'object_hist_1000_ipc_bottom_up.png'))
+# *************************
+# *************************
+top_k = 30
+text_batch = 1000
+n_batches_text = len(vgenome_obj_ontology)//text_batch + 1
+for ib, batch in enumerate(tqdm.tqdm(train_loader)): # Per images
+    images_batch, label, roi_coord, image_id = batch
+    if isinstance(images_batch, list):
+        if not images_batch:
+            continue
+    if images_batch.dim() == 5: # in case working with torch.utils.data.DataLoader
+        images_batch = images_batch.squeeze()
+    print(images_batch.shape[0])
     # print(label)
     obj_dict = dict()
 
-    for idx, img in enumerate(images_batch):
+    for ix, (img, lbl) in enumerate(zip(images_batch, label)): # ROI per image level
         bbox = [0, 0, img.shape[1], img.shape[2]] 
 
         obj_dict = dict()
-        for obj in tqdm.tqdm(vgenome_obj_ontology):
-            vlm_sim = vlm.compute_similarity(img, text=label[idx][0])
+        for idx in range(n_batches_text):
+            batch_ontology = vgenome_obj_ontology[idx*text_batch: min(len(vgenome_obj_ontology), (idx+1)*text_batch)]
+            vlm_sim = vlm.compute_similarity(img, text=batch_ontology)
             # vlm_sim = ontology_imp.compute_scores(img)
-            obj_dict.update({obj: float(vlm_sim)})
-            plot_vg_over_image(bbox=bbox, frame_=img.permute(1, 2, 0), 
-                                caption=str(vlm_type) + '_' + label[idx][0] + '_'+str(vlm_sim[0]), 
-                                lprob=vlm_sim, path=result_path, create_window=False)
-        print("save  dict")
+            [obj_dict.update({batch_ontology: float(vlm_sim)}) for batch_ontology, vlm_sim in zip(batch_ontology, vlm_sim)]
+            # plot_vg_over_image(bbox=bbox, frame_=img.permute(1, 2, 0), 
+            #                     caption=str(vlm_type) + '_' + label[idx][0] + '_'+str(vlm_sim[0]), 
+            #                     lprob=vlm_sim, path=result_path, create_window=False)
+        # print("save  ROI", ix)
+        obj_dict.update({'roi_coord': roi_coord[ix]})
+        obj_dict.update({'ground_truth': lbl[0]})
         obj_dict.update({'image_id' :image_id})
         results.append(obj_dict)
 
+    print("save  image_id", ib, image_id)
     df = pd.DataFrame(results)
     df.to_csv(os.path.join(result_path, res_file), index=False)
 
@@ -426,5 +470,34 @@ print (image)
 
 api.get_all_image_ids()
 images_data[0]
+
+for ib2, batch2 in enumerate(tqdm.tqdm(video_dataset)):
+    print(ib2)
+for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
+    print(ib2, images_batch2.shape, label2, roi_coord2, image_id2)
+    break
+
+for i in range(len(video_dataset)):
+    print(i)
+    a = video_dataset[i]
+
+for i in (video_dataset):
+    print(i)
+    break
+
+dim = 1
+for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
+    # dim = dim * images_batch2.shape[1]
+    print(images_batch2.shape, label2, roi_coord2, image_id2, ib2, dim)
+    break
+
+dim = 1
+for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
+    print(dim)
+    dim = dim * images_batch2.shape[1]
+    print( dim)
+
+for ib2, batch2 in enumerate(tqdm.tqdm(train_loader)): # Per images
+    print(ib2)
 
 """
