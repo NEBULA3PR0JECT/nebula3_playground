@@ -29,6 +29,9 @@ from nebula3_experts_vg.vg.vg_expert_utils import plot_vg_over_image
 import torch
 import pandas as pd
 import json
+from torchvision import transforms as T
+
+transform = T.ToPILImage()
 
 
 class PIPELINE:
@@ -53,11 +56,14 @@ pipeline = PIPELINE()
 # cursor = pipeline.db.aql.execute(query)
 # images_data = list(cursor)
 result_path = "/notebooks/nebula3_playground/images"
-res_file = "results_roi_det_vs_vg.csv"
 vgenome_images = '/datasets/dataset/vgenome/images/VG_100K'
 vgenome_metadata = "/datasets/dataset/vgenome/metadata"
 visual_grounding = False 
+limit_roi = True
+vlm_type = 'clip'#'clip' #'blip_itc'
 
+if not os.path.exists(result_path):
+    os.makedirs(result_path)
 
 def get_sc_graph(id):
     return vg.get_scene_graph(id, images=vgenome_metadata,
@@ -67,7 +73,7 @@ def get_sc_graph(id):
 
     vgenome_obj_ontology = list()
     # vgenome_set_obj = set()
-    for vg_ob in tqdm.tqdm(vg_objects):
+    for vg_ob in tqdm.tqdm(vg_objects):F
         obj = [x['names'][0] for x in vg_ob['objects']]
         vgenome_obj_ontology.append(obj)
 
@@ -141,7 +147,7 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
 
     def collate_fn(self, batch):
         return batch[0]
-
+# [ix for ix, x in enumerate(self.annotation) if os.path.basename(x['image']).split('.jpg')[0] =='1160254' ]
     def __getitem__(self, index):    
             
         ann = self.annotation[index]
@@ -161,15 +167,17 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
                 w = visual_objects['w']
                 y = visual_objects['y']
                 x = visual_objects['x']
-                x,y,w,h = self.bbox_xywh_to_xyxy((x,y,w,h))
+                xmin, ymin, xmax, ymax = self.bbox_xywh_to_xyxy((x,y,w,h))
                 
-                crop_image = image.crop((x,y,w,h))
+                crop_image = image.crop((xmin, ymin, xmax, ymax))
                 width, height = crop_image.size
-                if width > self.min_w and height > self.min_h:
+                if (width * height) > (self.min_w * self.min_h):
                     #print(width, height)
                     croped_images.append(crop_image)
                     label.append(visual_objects['names'])
                     roi_coord.append([x,y,w,h])
+                else:
+                    print("image_id {} roi_coord {} dropped".format(image_id, [x,y,w,h]))
         else:
             croped_images.append(image)
             label.append(["full image"])
@@ -188,10 +196,9 @@ class VisualGenomedatasetRoiLoader(visual_genome_dataset):
 
 from nebula3_videoprocessing.videoprocessing.vlm_factory import VlmFactory
 
-vlm_type = "clip"
 vlm = VlmFactory().get_vlm(vlm_type)
 results = list()
-res_file = "results_bottom_up_" + vlm_type + ".csv"
+res_file = "results_bottom_up_" + vlm_type + "2.csv"
 
 # Came from  : 
 # with open("/storage/ipc_data/paragraphs_v1.json", "r") as f:
@@ -207,8 +214,21 @@ with open(os.path.join(vgenome_metadata, "paragraphs_v1.json"), "r") as f:
 sample_ids = np.loadtxt(os.path.join(vgenome_metadata, "sample_ids_ipc_vgenome_ids.txt"))
 image_ids_related_to_ipc = [images_data[int(ix)]['image_id'] for ix in sample_ids]
 
+if limit_roi:
+    min_h=60
+    min_w=60
+    print("!!! ROI pooled by each patch should be gt {}".format(min_h*min_w))
+else:
+    min_h=0
+    min_w=0
+
+res_file = 'results_roi_det_vs_vg_min_h_' + str(min_h) + '_min_w_' + str(min_w) + '.csv'
+
+
 video_dataset = VisualGenomedatasetRoiLoader(max_words=-1, indirect_indexing_dictionary=image_ids_related_to_ipc,
-                                                indeirect_json_file_path=os.path.join(vgenome_metadata , "vgenome_image_data_related_to_1000_ipc_experiemnt.json"))
+                                                indeirect_json_file_path=os.path.join(vgenome_metadata ,"vgenome_image_data_related_to_1000_ipc_experiemnt.json"),
+                                                min_h=min_h, min_w=min_w)
+
 train_loader = torch.utils.data.DataLoader(dataset=video_dataset, batch_size=1, shuffle=False,
                                                     pin_memory=True, num_workers=0, collate_fn=video_dataset.collate_fn)
 # for vg_ob in tqdm.tqdm(sample_ids):
@@ -218,16 +238,19 @@ train_loader = torch.utils.data.DataLoader(dataset=video_dataset, batch_size=1, 
 # ontology_imp = SingleOntologyImplementation('vg_objects', 'clip')
 if 0: # stats of objects 
     label_stat = list()
-    for batch in tqdm.tqdm(video_dataset):
-        images_batch, label, image_id = batch
-        label_stat.append(label)
-    label_stat = np.concatenate(label_stat)
+    for batch in tqdm.tqdm(train_loader):
+        images_batch, label, roi_coord, image_id = batch
+        label_stat.extend(label)
+    # label_stat = np.concatenate(label_stat)
+    y = np.array([])
+    y = [np.append(y, np.array(x)) for x in label_stat]
+    label_stat = np.array(y)
     label_stat = sorted(label_stat)
     lbl_unique ,count = np.unique(label_stat, return_counts=True)
     ord_idx = np.argsort(count)[::-1]
     import matplotlib.pyplot as plt
     
-    len = 40
+    len = 2250
     height = count[ord_idx[:len]]
     bars = lbl_unique[ord_idx[:len]]
     x_pos = np.arange(bars.shape[0])
@@ -242,11 +265,15 @@ if 0: # stats of objects
     
     # Create names on the x axis
     plt.xticks(x_pos, bars, rotation='vertical')
-    plt.savefig(os.path.join(result_path, 'object_hist_1000_ipc_bottom_up.png'))
+    plt.savefig(os.path.join(result_path, 'object_hist_1000_ipc_bottom_up_len_' + str(len) + '.png'))
 # *************************
 # *************************
 top_k = 30
-text_batch = 1000
+if vlm_type == 'blip_itc':
+    text_batch = 64 # Model takes ~16G
+else:
+    text_batch = 1000
+
 n_batches_text = len(vgenome_obj_ontology)//text_batch + 1
 for ib, batch in enumerate(tqdm.tqdm(train_loader)): # Per images
     images_batch, label, roi_coord, image_id = batch
@@ -261,6 +288,8 @@ for ib, batch in enumerate(tqdm.tqdm(train_loader)): # Per images
 
     for ix, (img, lbl) in enumerate(zip(images_batch, label)): # ROI per image level
         bbox = [0, 0, img.shape[1], img.shape[2]] 
+        if vlm_type == 'blip_itc':
+            img = transform(img)
 
         obj_dict = dict()
         for idx in range(n_batches_text):
@@ -269,7 +298,7 @@ for ib, batch in enumerate(tqdm.tqdm(train_loader)): # Per images
             # vlm_sim = ontology_imp.compute_scores(img)
             [obj_dict.update({batch_ontology: float(vlm_sim)}) for batch_ontology, vlm_sim in zip(batch_ontology, vlm_sim)]
             # plot_vg_over_image(bbox=bbox, frame_=img.permute(1, 2, 0), 
-            #                     caption=str(vlm_type) + '_' + label[idx][0] + '_'+str(vlm_sim[0]), 
+            #                     caption=image_id.split('.')[0] + '_' +str(vlm_type) + '_' + label[idx][0] + '_'+str(vlm_sim[0]) + '_' + str(lbl[0]), 
             #                     lprob=vlm_sim, path=result_path, create_window=False)
         # print("save  ROI", ix)
         obj_dict.update({'roi_coord': roi_coord[ix]})
@@ -471,33 +500,16 @@ print (image)
 api.get_all_image_ids()
 images_data[0]
 
-for ib2, batch2 in enumerate(tqdm.tqdm(video_dataset)):
-    print(ib2)
-for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
-    print(ib2, images_batch2.shape, label2, roi_coord2, image_id2)
+nohup python -u 
+for ib, batch in enumerate(tqdm.tqdm(train_loader)): # Per images
+    images_batch, label, roi_coord, image_id = batch
+    if isinstance(images_batch, list):
+        if not images_batch:
+            continue
     break
 
-for i in range(len(video_dataset)):
-    print(i)
-    a = video_dataset[i]
-
-for i in (video_dataset):
-    print(i)
-    break
-
-dim = 1
-for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
-    # dim = dim * images_batch2.shape[1]
-    print(images_batch2.shape, label2, roi_coord2, image_id2, ib2, dim)
-    break
-
-dim = 1
-for ib2, (images_batch2, label2, roi_coord2, image_id2) in enumerate(tqdm.tqdm(train_loader)):
-    print(dim)
-    dim = dim * images_batch2.shape[1]
-    print( dim)
-
-for ib2, batch2 in enumerate(tqdm.tqdm(train_loader)): # Per images
-    print(ib2)
+plot_vg_over_image(bbox=bbox, frame_=img.permute(1, 2, 0), 
+                    caption=image_id.split('.')[0] + '_' +str(vlm_type) + '_' + label[idx][0] + '_'+str(vlm_sim[0]), 
+                    lprob=vlm_sim, path=result_path, create_window=False)
 
 """
